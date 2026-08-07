@@ -3,11 +3,17 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Mail\ResetPasswordMail;
+use App\Mail\WelcomeMail;
 use App\Models\User;
+use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 
 class AuthController extends Controller
@@ -24,14 +30,20 @@ class AuthController extends Controller
 
         $user = User::create([
             'name' => $validated['name'],
-            'company' => $validated['company'],
-            'phone' => $validated['phone'],
+            'company' => $validated['company'] ?? null,
+            'phone' => $validated['phone'] ?? null,
             'email' => $validated['email'],
             'password' => Hash::make($validated['password']),
             'role' => 'customer',
         ]);
 
         $token = $user->createToken('api-token')->plainTextToken;
+
+        try {
+            Mail::to($user->email)->send(new WelcomeMail($user));
+        } catch (\Throwable $e) {
+            // El SMTP puede no estar configurado; el usuario se crea igual.
+        }
 
         return response()->json([
             'user' => $user,
@@ -72,5 +84,61 @@ class AuthController extends Controller
     public function user(Request $request): JsonResponse
     {
         return response()->json($request->user());
+    }
+
+    public function forgot(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'email' => ['required', 'email'],
+        ]);
+
+        $user = User::where('email', $data['email'])->first();
+
+        if ($user) {
+            $token = Str::random(64);
+
+            DB::table('password_reset_tokens')->updateOrInsert(
+                ['email' => $data['email']],
+                ['token' => $token, 'created_at' => now()]
+            );
+
+            try {
+                Mail::to($data['email'])->send(new ResetPasswordMail($data['email'], $token));
+            } catch (\Throwable $e) {
+                // Si el SMTP no está configurado, no exponemos el error.
+            }
+        }
+
+        return response()->json([
+            'message' => 'Si el correo existe, recibirás un enlace para restablecer la contraseña.',
+        ]);
+    }
+
+    public function reset(Request $request): JsonResponse
+    {
+        $data = $request->validate([
+            'email' => ['required', 'email'],
+            'token' => ['required', 'string'],
+            'password' => ['required', 'string', 'min:8', 'confirmed'],
+        ]);
+
+        $record = DB::table('password_reset_tokens')
+            ->where('email', $data['email'])
+            ->where('token', $data['token'])
+            ->first();
+
+        if (! $record || Carbon::parse($record->created_at)->addMinutes(60)->isPast()) {
+            throw ValidationException::withMessages([
+                'token' => ['El enlace ha expirado o no es válido.'],
+            ]);
+        }
+
+        User::where('email', $data['email'])->update([
+            'password' => Hash::make($data['password']),
+        ]);
+
+        DB::table('password_reset_tokens')->where('email', $data['email'])->delete();
+
+        return response()->json(['message' => 'Contraseña actualizada correctamente.']);
     }
 }
